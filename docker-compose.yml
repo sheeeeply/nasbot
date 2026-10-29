@@ -1,0 +1,18 @@
+services:
+  nasbot:
+    build: .
+    image: nasbot:latest
+    container_name: nasbot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - nasbot-data:/data   # alert state + heartbeat; survives upgrades
+    # If a Tailscale MagicDNS name (e.g. truenas.tail1234.ts.net) won't resolve inside
+    # the container, either use the NAS's 100.x.y.z address in TRUENAS_URL or uncomment:
+    # network_mode: host
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "3" }
+
+volumes:
+  nasbot-data:
