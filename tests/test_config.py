@@ -151,5 +151,52 @@ def test_env_example_is_valid(tmp_path):
     import re
     read = set(re.findall(r'get\("([A-Z_]+)"', src)) | {"DISCORD_TOKEN", "TRUENAS_API_KEY", "TRUENAS_AUTH",
                                                          "ALERT_MIN_LEVEL", "MENTION_MIN_LEVEL"}
-    advanced = {"TRUENAS_CALL_TIMEOUT", "DATA_DIR", "TRUENAS_ALLOW_INSECURE"}  # README-only, on purpose
+    advanced = {"TRUENAS_CALL_TIMEOUT", "DATA_DIR", "TRUENAS_ALLOW_INSECURE",  # README-only, on purpose
+                "MEDIA_TIMEOUT", "MEDIA_VERIFY_SSL"}
     assert read - advanced <= documented, read - advanced - documented
+
+
+# ------------------------------------------------------------------ media (Sonarr/Radarr)
+
+def test_media_off_by_default():
+    cfg = from_env(BASE_ENV)
+    assert cfg.arr_instances == () and not cfg.media_enabled
+    assert (cfg.media_poll_interval, cfg.media_grace_minutes) == (300, 10)
+    assert not cfg.media_watch_stalled and not cfg.media_notify_imports and not cfg.media_mention
+
+
+def test_media_instances_and_options(tmp_path):
+    keyfile = tmp_path / "radarr.key"
+    keyfile.write_text("radarr-key\n")
+    cfg = from_env({**BASE_ENV, "SONARR_URL": "192.168.1.158:8989/", "SONARR_API_KEY": "s-key",
+                    "SONARR_LINK_URL": "http://nas.soay-terrapin.ts.net:8989",
+                    "RADARR_URL": "http://192.168.1.158:7878/api/v3", "RADARR_API_KEY_FILE": str(keyfile),
+                    "MEDIA_POLL_INTERVAL_SECONDS": "120", "MEDIA_GRACE_MINUTES": "0",
+                    "MEDIA_WATCH_STALLED": "yes", "MEDIA_NOTIFY_IMPORTS": "true", "MEDIA_MENTION": "on",
+                    "MEDIA_HEALTH_IGNORE": "UpdateCheck, IndexerLongTermStatusCheck",
+                    "MEDIA_VERIFY_SSL": "false", "MEDIA_TIMEOUT": "5"})
+    sonarr, radarr = cfg.arr_instances
+    assert (sonarr.kind, sonarr.url, sonarr.api_key) == ("sonarr", "http://192.168.1.158:8989", "s-key")
+    assert sonarr.web_url == "http://nas.soay-terrapin.ts.net:8989"
+    assert (radarr.url, radarr.api_key, radarr.web_url) == ("http://192.168.1.158:7878", "radarr-key",
+                                                             "http://192.168.1.158:7878")
+    assert cfg.media_enabled and cfg.media_poll_interval == 120 and cfg.media_grace_minutes == 0
+    assert cfg.media_watch_stalled and cfg.media_notify_imports and cfg.media_mention
+    assert cfg.media_health_ignore == {"UpdateCheck", "IndexerLongTermStatusCheck"}
+    assert cfg.media_verify_ssl is False and cfg.media_timeout == 5.0
+
+
+def test_media_problems_are_all_reported():
+    with pytest.raises(ConfigError) as err:
+        from_env({**BASE_ENV, "SONARR_URL": "http://x:8989", "RADARR_API_KEY": "k",
+                  "MEDIA_POLL_INTERVAL_SECONDS": "10", "MEDIA_GRACE_MINUTES": "-1", "MEDIA_TIMEOUT": "0"})
+    text = "\n".join(err.value.problems)
+    assert "SONARR_URL is set but SONARR_API_KEY" in text and "Settings → General → Security" in text
+    assert "RADARR_API_KEY is set but RADARR_URL is missing" in text
+    assert "MEDIA_POLL_INTERVAL_SECONDS must be >= 60" in text
+    assert "MEDIA_GRACE_MINUTES must be >= 0" in text and "MEDIA_TIMEOUT must be > 0" in text
+
+
+def test_media_bad_url():
+    with pytest.raises(ConfigError, match="SONARR_URL / SONARR_LINK_URL: unsupported scheme"):
+        from_env({**BASE_ENV, "SONARR_URL": "ftp://x", "SONARR_API_KEY": "k"})

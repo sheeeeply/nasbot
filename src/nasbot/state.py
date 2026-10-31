@@ -34,6 +34,13 @@ class State:
     silence_until: float | None = None
     suppressed: list[str] = field(default_factory=list)
     last_digest_date: str | None = None
+    # Media watcher, keyed by app ("sonarr" / "radarr"). An app missing from media_health has not been
+    # baselined yet, so its first health check is silent (like the first TrueNAS alert poll).
+    media_attention: dict[str, dict[str, dict]] = field(default_factory=dict)
+    media_health: dict[str, dict[str, dict]] = field(default_factory=dict)
+    media_failures: dict[str, int] = field(default_factory=dict)
+    media_down_since: dict[str, float] = field(default_factory=dict)
+    media_import_cursor: dict[str, str] = field(default_factory=dict)
 
     def to_json(self) -> dict:
         data = asdict(self)

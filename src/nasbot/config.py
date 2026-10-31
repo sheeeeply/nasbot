@@ -28,6 +28,47 @@ def level_rank(level: str) -> int:
         return LEVELS.index("WARNING")
 
 
+Kind = Literal["sonarr", "radarr"]
+KINDS: tuple[Kind, ...] = ("sonarr", "radarr")
+DISPLAY: dict[str, str] = {"sonarr": "Sonarr", "radarr": "Radarr"}
+
+
+def normalize_arr_url(raw: str) -> str:
+    """``192.168.1.158:8989`` -> ``http://192.168.1.158:8989``; keeps a URL base such as
+    ``/sonarr``; drops a trailing slash or a pasted ``/api/v3``."""
+    raw = raw.strip()
+    if not raw:
+        raise ValueError("empty URL")
+    if "://" not in raw:
+        raw = "http://" + raw
+    parts = urlsplit(raw)
+    if parts.scheme.lower() not in ("http", "https"):
+        raise ValueError(f"unsupported scheme {parts.scheme!r} (use http or https)")
+    if not parts.netloc:
+        raise ValueError("missing host")
+    path = parts.path.rstrip("/")
+    for suffix in ("/api/v3", "/api"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+    return urlunsplit((parts.scheme.lower(), parts.netloc, path, "", ""))
+
+
+@dataclass(frozen=True)
+class ArrInstance:
+    kind: Kind
+    url: str
+    api_key: str = field(repr=False)
+    link_url: str | None = None  # where humans open the UI, if different from `url`
+
+    @property
+    def name(self) -> str:
+        return DISPLAY[self.kind]
+
+    @property
+    def web_url(self) -> str:
+        return self.link_url or self.url
+
+
 class ConfigError(ValueError):
     """Raised with every configuration problem found, not just the first."""
 
@@ -69,6 +110,17 @@ class Config:
     digest_tz: str = "UTC"
     healthcheck_url: str | None = None
 
+    # Media (Sonarr / Radarr) — all optional; the watcher is off unless an instance is configured
+    arr_instances: tuple[ArrInstance, ...] = ()
+    media_poll_interval: int = 300
+    media_grace_minutes: int = 10
+    media_watch_stalled: bool = False
+    media_notify_imports: bool = False
+    media_mention: bool = False
+    media_health_ignore: frozenset[str] = field(default_factory=frozenset)
+    media_verify_ssl: bool = True
+    media_timeout: float = 20.0
+
     # Runtime
     data_dir: Path = Path("/data")
     log_level: str = "INFO"
@@ -97,6 +149,10 @@ class Config:
     @property
     def access_is_open(self) -> bool:
         return not self.allowed_user_ids and not self.allowed_role_ids
+
+    @property
+    def media_enabled(self) -> bool:
+        return bool(self.arr_instances)
 
 
 def normalize_truenas_url(raw: str) -> str:
@@ -221,6 +277,40 @@ def from_env(env: Mapping[str, str] | None = None, *, require_discord: bool = Tr
     get("DATA_DIR", Path, "data_dir")
     get("LOG_LEVEL", lambda v: v.upper(), "log_level")
 
+    # Media watcher: an instance is enabled by giving both its URL and its API key.
+    instances: list[ArrInstance] = []
+    for kind in KINDS:
+        prefix = kind.upper()
+        url_raw = env.get(f"{prefix}_URL", "").strip()
+        key = secret(f"{prefix}_API_KEY")
+        if not url_raw and not key:
+            continue
+        if not url_raw:
+            problems.append(f"{prefix}_API_KEY is set but {prefix}_URL is missing")
+            continue
+        if not key:
+            problems.append(f"{prefix}_URL is set but {prefix}_API_KEY (or {prefix}_API_KEY_FILE) is missing "
+                            f"— find it in {DISPLAY[kind]} → Settings → General → Security")
+            continue
+        try:
+            url = normalize_arr_url(url_raw)
+            link_raw = env.get(f"{prefix}_LINK_URL", "").strip()
+            link = normalize_arr_url(link_raw) if link_raw else None
+        except ValueError as exc:
+            problems.append(f"{prefix}_URL / {prefix}_LINK_URL: {exc}")
+            continue
+        instances.append(ArrInstance(kind=kind, url=url, api_key=key, link_url=link))
+    values["arr_instances"] = tuple(instances)
+    get("MEDIA_POLL_INTERVAL_SECONDS", int, "media_poll_interval")
+    get("MEDIA_GRACE_MINUTES", int, "media_grace_minutes")
+    get("MEDIA_WATCH_STALLED", _bool, "media_watch_stalled")
+    get("MEDIA_NOTIFY_IMPORTS", _bool, "media_notify_imports")
+    get("MEDIA_MENTION", _bool, "media_mention")
+    get("MEDIA_HEALTH_IGNORE", lambda v: frozenset(p.strip() for p in v.split(",") if p.strip()),
+        "media_health_ignore")
+    get("MEDIA_VERIFY_SSL", _bool, "media_verify_ssl")
+    get("MEDIA_TIMEOUT", float, "media_timeout")
+
     for var, key in (("ALERT_MIN_LEVEL", "min_alert_level"), ("MENTION_MIN_LEVEL", "mention_min_level")):
         raw = env.get(var, "").strip().upper()
         if raw:
@@ -234,6 +324,12 @@ def from_env(env: Mapping[str, str] | None = None, *, require_discord: bool = Tr
         problems.append("POLL_INTERVAL_SECONDS must be >= 15 (TrueNAS rate-limits aggressive clients)")
     if values.get("unreachable_after", 3) < 1:
         problems.append("UNREACHABLE_AFTER_FAILURES must be >= 1")
+    if values.get("media_poll_interval", 300) < 60:
+        problems.append("MEDIA_POLL_INTERVAL_SECONDS must be >= 60")
+    if values.get("media_grace_minutes", 10) < 0:
+        problems.append("MEDIA_GRACE_MINUTES must be >= 0")
+    if values.get("media_timeout", 20.0) <= 0:
+        problems.append("MEDIA_TIMEOUT must be > 0")
     if values.get("call_timeout", 30.0) <= 0:
         problems.append("TRUENAS_CALL_TIMEOUT must be > 0")
     if "digest_tz" in values:

@@ -2,7 +2,8 @@
 
 A self-hosted Discord bot for a TrueNAS server. Ask it how the NAS is doing with slash commands, and it
 pushes alerts to a channel on its own — including the things TrueNAS can't tell you itself, like the NAS
-dropping off the network or an app crashing.
+dropping off the network or an app crashing. Optionally it watches Sonarr and Radarr too, and tells you when a
+download needs a human.
 
 - **Outbound-only.** The bot dials out to Discord and to your NAS. No ports to open, nothing exposed — it
   works fine over Tailscale.
@@ -21,6 +22,8 @@ dropping off the network or an app crashing.
 | `/nas apps` | Installed apps, their state, and available updates |
 | `/nas ping` | Bot ↔ Discord and bot ↔ TrueNAS latency, last poll result, mute status |
 | `/nas mute minutes:N` | Hold notifications during maintenance (`0` unmutes). You get a summary of what was held back |
+| `/media queue` | *(with Sonarr/Radarr configured)* What's downloading with progress & ETA, and anything that needs you |
+| `/media health` | *(with Sonarr/Radarr configured)* Sonarr/Radarr health checks |
 
 And it posts, unprompted, to your alert channel:
 
@@ -33,6 +36,11 @@ And it posts, unprompted, to your alert channel:
 | **Rebooted** | Detected from boot time, even if it was quick enough to never look "down" |
 | **App crashed / stopped / recovered** | TrueNAS itself raises no alert for these |
 | **Daily digest** (optional) | `/nas status` at a time you pick, in your time zone |
+| **Download needs you** (Sonarr/Radarr) | Finished but *Unable to Import Automatically*, or failed — once per download, after a grace period, with what Sonarr said and what to do. A season pack is one message, not one per episode |
+| **Download sorted** | When a download you were told about leaves that state |
+| **Sonarr/Radarr health** | Indexers failing, download client unreachable, disk space… appearing and clearing |
+| **Sonarr/Radarr unreachable / back** | Not while the whole NAS is down — that alert already covers it |
+| **Ready to watch** (optional) | One message per download when something is imported |
 
 Urgent notifications (default: CRITICAL and above, NAS unreachable, app crashes when the threshold allows)
 can `@mention` a role or a user. Timestamps use Discord's native format, so everyone sees them in their own
@@ -140,6 +148,47 @@ Uptime Kuma push URLs work too.
 
 ---
 
+## Sonarr & Radarr (optional)
+
+If you run an *arr* media stack, nasbot can tell you when it needs a human — the downloads that otherwise sit
+in **Activity → Queue** with an orange icon until you happen to look. It's read-only, like the TrueNAS side.
+
+1. Copy each app's API key: **Settings → General → Security → API Key**.
+2. Add to `.env` (only the apps you use):
+
+   ```bash
+   SONARR_URL=http://192.168.1.158:8989
+   SONARR_API_KEY=...
+   RADARR_URL=http://192.168.1.158:7878
+   RADARR_API_KEY=...
+   # optional: the address you open the apps at, for links in Discord
+   SONARR_LINK_URL=http://nas.your-tailnet.ts.net:8989
+   ```
+
+   Use the NAS's LAN IP and the app's published port — that's reachable from the bot's container. Plain
+   `http` is fine on your own network (unlike TrueNAS, the *arr apps don't revoke keys).
+3. `docker compose run --rm nasbot check` now also checks each app:
+
+   ```
+   Sonarr check — http://192.168.1.158:8989
+     ✔ connect + API key        Sonarr 4.0.15.2941
+     ✔ queue                    3 download(s), 1 need attention now
+     ✔ health                   0 issue(s)
+   ```
+4. `docker compose up -d --build`. The startup message lists the apps it's watching.
+
+**What counts as "needs you":** a finished download Sonarr/Radarr couldn't import on its own (wrong episode
+numbering, a sample, an unexpected file layout…) and failed downloads. Stalled torrents are left alone by
+default because tools like [Cleanuparr](https://github.com/Cleanuparr/Cleanuparr) replace them automatically —
+set `MEDIA_WATCH_STALLED=true` if you don't run one. Nothing is reported until it has been stuck for
+`MEDIA_GRACE_MINUTES` (default 10), so downloads that sort themselves out never make noise. *Waiting to
+Import* is treated as the temporary hold it usually is — e.g. Sonarr waits up to 48 hours to import a new
+episode whose title is still TBA — and is only reported if it lasts more than 49 hours.
+
+Mute (`/nas mute`) and state persistence cover media notifications too.
+
+---
+
 ## Configuration reference
 
 All settings are environment variables (see `.env.example`). Secrets also accept a `_FILE` variant —
@@ -173,6 +222,17 @@ All settings are environment variables (see `.env.example`). Secrets also accept
 | `DATA_DIR` | `/data` | State + heartbeat (advanced) |
 | `TRUENAS_CALL_TIMEOUT` | `30` | Seconds per API call (advanced) |
 | `TRUENAS_ALLOW_INSECURE` | `false` | Permit `plain` auth over `ws://`. Only for test rigs — a real NAS will revoke the key |
+| `SONARR_URL` / `SONARR_API_KEY` | — | Watch Sonarr (both needed). `_FILE` variant for the key |
+| `RADARR_URL` / `RADARR_API_KEY` | — | Watch Radarr (both needed). `_FILE` variant for the key |
+| `SONARR_LINK_URL` / `RADARR_LINK_URL` | the URL | Address used for links in Discord, if you open the apps differently |
+| `MEDIA_POLL_INTERVAL_SECONDS` | `300` | How often to check Sonarr/Radarr. Minimum 60 |
+| `MEDIA_GRACE_MINUTES` | `10` | How long a download must be stuck before it's reported |
+| `MEDIA_WATCH_STALLED` | `false` | Also report stalled (no seeders) downloads |
+| `MEDIA_NOTIFY_IMPORTS` | `false` | "Ready to watch" messages |
+| `MEDIA_MENTION` | `false` | @mention on downloads that need you |
+| `MEDIA_HEALTH_IGNORE` | — | Health check names to drop, e.g. `IndexerLongTermStatusCheck`. Shown in each message's footer |
+| `MEDIA_VERIFY_SSL` | `true` | `false` if the apps sit behind a self-signed `https` proxy (advanced) |
+| `MEDIA_TIMEOUT` | `20` | Seconds per Sonarr/Radarr request (advanced) |
 
 **Upgrading TrueNAS to 26/27:** set `TRUENAS_AUTH=scram`. Nothing else changes.
 
@@ -192,6 +252,9 @@ All settings are environment variables (see `.env.example`). Secrets also accept
 | `Discord rejected DISCORD_TOKEN` | Reset the token in the Developer Portal and update `.env` |
 | Bot locked out for 10 minutes after many restarts | TrueNAS rate-limits failed logins (20/min). The bot backs off 10 min after a rejected key so it never trips this itself |
 | Container shows `unhealthy` | The monitor loop stopped cycling; usually Discord login. `docker compose logs` |
+| `check`: **✘ connect** under Sonarr/Radarr | Use the NAS's LAN IP + published port (`http://192.168.1.158:8989`), not a container name — the bot isn't on the *arr stack's Docker network |
+| `check`: **✘ request … didn't return JSON** | The URL points at something else (a login page, the wrong port), or the app uses a URL base: add it, e.g. `http://host:8989/sonarr` |
+| `/media` commands don't appear | Only registered when a Sonarr/Radarr URL + key are set. Restart after editing `.env` |
 
 **Zero-code alternative / belt-and-braces.** TrueNAS can also push alerts to Discord directly: **System →
 Alert Settings → Add → Slack**, with your channel's webhook URL plus `/slack` on the end (Discord accepts
@@ -205,12 +268,13 @@ doesn't depend on this bot.
 ```bash
 pip install -e ".[dev]"
 ruff check src tests
-pytest -q            # 160 tests, ~15s
+pytest -q            # 237 tests, ~10s
 ```
 
 The suite includes end-to-end tests that run iXsystems' real `truenas_api_client` against a
 protocol-faithful mock of middlewared (`tests/mock_truenas.py`): handshake, API-key login, realtime event
 streaming, permission errors, dropped connections and reconnects, plus the `check` CLI as a subprocess.
+The media watcher is tested the same way against a Sonarr/Radarr API stand-in (`tests/mock_arr.py`).
 
 ```
 src/nasbot/
@@ -223,6 +287,9 @@ src/nasbot/
   formatting.py  embeds, within Discord's size limits
   bot.py         slash commands + posting loop
   heartbeat.py   Docker healthcheck + dead-man's-switch pings
+  arr.py         Sonarr/Radarr v3 API client + models (queue, health, history)
+  media.py       the media watcher: needs-attention, health, reachability, imports (no Discord I/O)
+  notify.py      the Notification both watchers hand to the bot
 ```
 
 MIT licensed.

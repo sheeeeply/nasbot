@@ -8,11 +8,18 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 import discord
 
-from .config import level_rank
+from .arr import HealthIssue, ImportEvent, Release
+from .config import LEVELS, ArrInstance, level_rank
 from .models import Alert, App, Disk, Pool, Snapshot
+
+if TYPE_CHECKING:
+    from .media import AppOverview
+
+LEVELS_BY_RANK = dict(enumerate(LEVELS))
 
 COLOR_OK = 0x2ECC71
 COLOR_WARN = 0xF1C40F
@@ -393,3 +400,232 @@ def silence_summary_embed(suppressed: list[str]) -> discord.Embed:
         description=_join_lines([f"• {s}" for s in suppressed], MAX_DESCRIPTION),
         color=COLOR_INFO,
     )
+
+
+# ------------------------------------------------------------ media (Sonarr/Radarr)
+
+# reason -> (icon, short headline, what to do — {app} is replaced with Sonarr/Radarr)
+REASON_TEXT: dict[str, tuple[str, str, str]] = {
+    "import": ("📥", "needs manual import",
+               "Open **{app} → Activity → Queue**, click the 👤 *Manual Import* icon on this release, fix any "
+               "red rows (pick the right episode/movie), then **Import**."),
+    "failed": ("❌", "download failed",
+               "{app} normally blocklists a failed release and searches for another one by itself. If nothing new "
+               "shows up in **Activity → Queue**, run a search for it manually."),
+    "waiting": ("⏳", "still waiting to import",
+                "{app} has held this finished download for over two days. Holds are normally temporary (a new "
+                "episode whose title is still *TBA*, an archive still being extracted). Hover the icon in "
+                "**{app} → Activity → Queue** for the reason; *Manual Import* (👤) imports it now."),
+    "stalled": ("⏸️", "download stalled",
+                "No data is arriving (no seeders). Cleanuparr replaces stalled downloads automatically if it's set "
+                "up; otherwise remove it in **{app} → Activity → Queue** with *Blocklist and Search*."),
+}
+REASON_COLOR = {"import": COLOR_WARN, "failed": COLOR_ERROR, "stalled": COLOR_MUTED, "waiting": COLOR_MUTED}
+
+
+def episode_ranges(episodes: list[tuple[int, int]], *, limit: int = 300) -> str:
+    """[(1,4),(1,6),(1,7),(1,8),(2,1)] -> 'S01E04, E06–E08 · S02E01' (consecutive runs collapsed)."""
+    by_season: dict[int, list[int]] = {}
+    for season, ep in sorted(set(episodes)):
+        by_season.setdefault(season, []).append(ep)
+    parts = []
+    for season, eps in by_season.items():
+        runs: list[tuple[int, int]] = []
+        for e in eps:
+            if runs and e == runs[-1][1] + 1:
+                runs[-1] = (runs[-1][0], e)
+            else:
+                runs.append((e, e))
+        width = max(2, len(str(eps[-1])))
+        text = ", ".join(f"E{a:0{width}d}" if a == b else f"E{a:0{width}d}–E{b:0{width}d}" for a, b in runs)
+        parts.append(f"S{season:02d}{text}")
+    return truncate(" · ".join(parts), limit)
+
+
+def _episodes_line(episodes: list[tuple[int, int]]) -> str | None:
+    if not episodes:
+        return None
+    n = len(episodes)
+    return f"{episode_ranges(episodes)} ({n} episode{'s' if n != 1 else ''})"
+
+
+def _queue_link(inst: ArrInstance) -> str:
+    return f"{inst.web_url}/activity/queue"
+
+
+def attention_embed(inst: ArrInstance, rel: Release, reason: str) -> discord.Embed:
+    icon, headline, fix = REASON_TEXT[reason]
+    embed = discord.Embed(
+        title=truncate(f"{icon} {headline[0].upper()}{headline[1:]}: {rel.subject}", 256),
+        url=_queue_link(inst),
+        description=f"`{truncate(rel.release, 400)}`\n\n**What to do:** {fix.format(app=inst.name)}",
+        color=REASON_COLOR[reason],
+    )
+    if (eps := _episodes_line(rel.episodes)) is not None:
+        embed.add_field(name="Episodes", value=truncate(eps, MAX_FIELD_VALUE), inline=False)
+    msgs = rel.messages
+    if msgs:
+        lines = [f"• {truncate(m, 200)}" + (f" — {n} files" if n > 1 else "") for m, n in msgs[:4]]
+        if len(msgs) > 4:
+            lines.append(f"…and {len(msgs) - 4} more")
+        embed.add_field(name=f"What {inst.name} says", value=truncate("\n".join(lines), MAX_FIELD_VALUE),
+                        inline=False)
+    size_bits = []
+    if rel.size:
+        size_bits.append(human_bytes(rel.size))
+    if reason == "stalled" and rel.progress is not None:
+        size_bits.append(f"{bar(rel.progress, 8)} {rel.progress * 100:.0f}%")
+    if size_bits:
+        embed.add_field(name="Size", value=" · ".join(size_bits), inline=True)
+    client = rel.first.client
+    embed.set_footer(text=f"{inst.name}" + (f" · {client}" if client else ""))
+    return embed
+
+
+def attention_burst_embed(inst: ArrInstance, raised: list[tuple[Release, str]]) -> discord.Embed:
+    lines = []
+    for rel, reason in raised:
+        icon, headline, _ = REASON_TEXT[reason]
+        eps = f" · {len(rel.episodes)} ep" if rel.episodes else ""
+        lines.append(f"{icon} **{truncate(rel.subject, 80)}** — {headline}{eps}")
+    worst = max((r for _, r in raised), key=REASON_RANK_FMT.__getitem__)
+    embed = discord.Embed(title=f"⚠️ {len(raised)} {inst.name} downloads need attention", url=_queue_link(inst),
+                          description=_join_lines(lines, MAX_DESCRIPTION - 200)
+                          + f"\n\nOpen **{inst.name} → Activity → Queue** to sort them out.",
+                          color=REASON_COLOR[worst])
+    embed.set_footer(text=inst.name)
+    return embed
+
+
+def attention_resolved_embed(inst: ArrInstance, entries: list[dict]) -> discord.Embed:
+    if len(entries) == 1:
+        e = entries[0]
+        embed = discord.Embed(title=truncate(f"✅ Sorted: {e.get('subject', '?')}", 256),
+                              description=f"`{truncate(str(e.get('release', '')), 400)}` no longer needs attention.",
+                              color=COLOR_OK)
+    else:
+        embed = discord.Embed(title=f"✅ {len(entries)} {inst.name} downloads sorted", color=COLOR_OK,
+                              description=_join_lines([f"• {e.get('subject', '?')}" for e in entries],
+                                                      MAX_DESCRIPTION))
+    embed.set_footer(text=inst.name)
+    return embed
+
+
+def arr_health_embed(inst: ArrInstance, issue: HealthIssue, *, cleared: bool = False) -> discord.Embed:
+    if cleared:
+        embed = discord.Embed(title=truncate(f"✅ {inst.name} resolved: {issue.message}", 256), color=COLOR_OK)
+    else:
+        embed = discord.Embed(
+            title=f"{level_emoji(issue.level)} {inst.name} {issue.type}",
+            url=issue.wiki or f"{inst.web_url}/system/status",
+            description=truncate(issue.message, MAX_DESCRIPTION - 200)
+            + f"\n\nDetails: **{inst.name} → System → Status**.",
+            color=level_color(issue.level),
+        )
+    embed.set_footer(text=f"{inst.name} · {issue.source}")
+    return embed
+
+
+def arr_down_embed(inst: ArrInstance, since: datetime, error: str | None) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"🔴 {inst.name} is unreachable",
+        description=f"No answer from `{inst.url}` since {ts(since)}."
+        + (f"\n```{truncate(error, 500)}```" if error else "")
+        + "\nCheck the container is running (Dockge / Apps) and the URL and API key in nasbot's `.env`.",
+        color=COLOR_CRIT,
+    )
+    embed.set_footer(text="I'll post again when it's back.")
+    return embed
+
+
+def arr_up_embed(inst: ArrInstance, downtime_seconds: float) -> discord.Embed:
+    return discord.Embed(title=f"🟢 {inst.name} is reachable again",
+                         description=f"Unreachable for about {human_duration(downtime_seconds)}.", color=COLOR_OK)
+
+
+def _import_summary(batch: list[ImportEvent]) -> str:
+    eps = [(e.season, e.episode) for e in batch if e.season is not None and e.episode is not None]
+    bits = []
+    if eps:
+        bits.append(_episodes_line(eps) or "")
+    qualities = sorted({e.quality for e in batch if e.quality})
+    if qualities:
+        bits.append(" / ".join(qualities))
+    return " · ".join(b for b in bits if b)
+
+
+def imported_embed(inst: ArrInstance, batch: list[ImportEvent]) -> discord.Embed:
+    icon = "📺" if inst.kind == "sonarr" else "🎬"
+    embed = discord.Embed(title=truncate(f"{icon} Ready to watch: {batch[0].subject}", 256),
+                          description=_import_summary(batch) or None, color=COLOR_INFO,
+                          timestamp=max((e.when for e in batch if e.when), default=None))
+    embed.set_footer(text=f"Imported by {inst.name}")
+    return embed
+
+
+def imported_burst_embed(inst: ArrInstance, batches: list[list[ImportEvent]]) -> discord.Embed:
+    icon = "📺" if inst.kind == "sonarr" else "🎬"
+    lines = [f"{icon} **{truncate(b[0].subject, 80)}**" + (f" — {s}" if (s := _import_summary(b)) else "")
+             for b in batches]
+    embed = discord.Embed(title=f"{icon} {len(batches)} new downloads ready to watch",
+                          description=_join_lines(lines, MAX_DESCRIPTION), color=COLOR_INFO)
+    embed.set_footer(text=f"Imported by {inst.name}")
+    return embed
+
+
+def media_queue_embed(overviews: list[AppOverview]) -> discord.Embed:
+    needs = sum(1 for ov in overviews for _, r in ov.releases if r in ("import", "failed"))  # not holds/stalls
+    errors = any(ov.error for ov in overviews)
+    color = COLOR_CRIT if errors else COLOR_WARN if needs else COLOR_OK
+    embed = discord.Embed(title="Media queue", color=color)
+    for ov in overviews[:MAX_FIELDS]:
+        name = ov.instance.name
+        if ov.error:
+            embed.add_field(name=f"🔴 {name}", value=truncate(ov.error, MAX_FIELD_VALUE), inline=False)
+            continue
+        if not ov.releases:
+            embed.add_field(name=f"🟢 {name}", value="Queue is empty.", inline=False)
+            continue
+        flagged = [(r, why) for r, why in ov.releases if why]
+        active = [r for r, why in ov.releases if not why]
+        needs_you = sum(1 for _, why in flagged if why in ("import", "failed"))
+        head = f"{len(ov.releases)} download{'s' if len(ov.releases) != 1 else ''}"
+        if needs_you:
+            head += f" · ⚠️ {needs_you} need{'s' if needs_you == 1 else ''} you"
+        lines = [head]
+        for rel, why in sorted(flagged, key=lambda rw: -REASON_RANK_FMT[rw[1]]):
+            lines.append(f"{REASON_TEXT[why][0]} **{truncate(rel.subject, 60)}** — {QUEUE_LABEL[why]}")
+        for rel in sorted(active, key=lambda r: -(r.progress or 0))[:8]:
+            pct = f"{rel.progress * 100:.0f}%" if rel.progress is not None else "?"
+            eta = f" · done {ts(rel.eta)}" if rel.eta and (rel.progress or 0) < 1 else ""
+            state = rel.first.status or "queued"
+            lines.append(f"{bar(rel.progress, 8)} {pct} **{truncate(rel.subject, 50)}** `{state}`{eta}")
+        if len(active) > 8:
+            lines.append(f"…and {len(active) - 8} more")
+        icon = "🟠" if needs_you else "🟢"
+        embed.add_field(name=f"{icon} {name}", value=_join_lines(lines, MAX_FIELD_VALUE), inline=False)
+    embed.set_footer(text="Live from Sonarr/Radarr")
+    return embed
+
+
+REASON_RANK_FMT = {"stalled": 0, "waiting": 1, "import": 2, "failed": 3}
+QUEUE_LABEL = {"import": "needs manual import", "failed": "download failed",
+               "waiting": "waiting to import (usually a temporary hold)", "stalled": "stalled"}
+
+
+def media_health_embed(overviews: list[AppOverview]) -> discord.Embed:
+    issues = [i for ov in overviews for i in ov.health]
+    errors = [ov for ov in overviews if ov.error]
+    worst = max((level_rank(i.level) for i in issues), default=-1)
+    color = COLOR_CRIT if errors else level_color(LEVELS_BY_RANK[worst]) if issues else COLOR_OK
+    embed = discord.Embed(title="Media health", color=color)
+    for ov in overviews[:MAX_FIELDS]:
+        name = ov.instance.name
+        if ov.error:
+            embed.add_field(name=f"🔴 {name}", value=truncate(ov.error, MAX_FIELD_VALUE), inline=False)
+        elif not ov.health:
+            embed.add_field(name=f"🟢 {name}", value="No health issues.", inline=False)
+        else:
+            lines = [f"{level_emoji(i.level)} {truncate(i.message, 300)}" for i in ov.health]
+            embed.add_field(name=f"🟠 {name}", value=_join_lines(lines, MAX_FIELD_VALUE), inline=False)
+    return embed
