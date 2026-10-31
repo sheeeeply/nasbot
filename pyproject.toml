@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nasbot"
-version = "1.0.0"
+version = "1.1.0"
 description = "Discord bot for TrueNAS: on-demand status via slash commands and pushed alerts."
 readme = "README.md"
 requires-python = ">=3.11"

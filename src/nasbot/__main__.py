@@ -1,7 +1,7 @@
 """Entry point.
 
     nasbot run          start the bot (default)
-    nasbot check        verify the TrueNAS connection and API permissions, no Discord needed
+    nasbot check        verify the TrueNAS (and Sonarr/Radarr) connections and permissions, no Discord needed
     nasbot healthcheck  exit 0 if the monitor loop is alive (used by Docker HEALTHCHECK)
 """
 
@@ -36,13 +36,17 @@ def cmd_run() -> int:
     _setup_logging(cfg.log_level)
 
     from .bot import NASBot
+    from .media import MediaWatcher
     from .monitor import Monitor
     from .state import StateStore
 
     log = logging.getLogger("nasbot")
     log.info("nasbot %s starting (TrueNAS %s, auth=%s)", __version__, cfg.truenas_url, cfg.truenas_auth)
     api = TrueNAS(cfg)
-    monitor = Monitor(api, cfg, StateStore(cfg.state_path))
+    media = MediaWatcher.from_config(cfg)
+    if media is not None:
+        log.info("Media watcher on: %s every %ss", ", ".join(media.names), cfg.media_poll_interval)
+    monitor = Monitor(api, cfg, StateStore(cfg.state_path), media=media)
     bot = NASBot(cfg, api, monitor)
     import discord
 
@@ -128,8 +132,46 @@ async def _check(cfg) -> int:
     rtt = await api.ping()
     line("✔", "latency", f"{rtt:.0f} ms")
     await api.close()
+    ok = await _check_media(cfg, line) and ok
     print("\nAll good." if ok else "\nSome required checks failed (see ✘ above).")
     return 0 if ok else 1
+
+
+async def _check_media(cfg, line) -> bool:
+    """Sonarr/Radarr part of `nasbot check`. Returns False if a configured app is unusable."""
+    from .arr import ArrAuthError, ArrCallError, ArrClient, ArrUnavailable, group_releases
+    from .media import release_reason
+
+    if not cfg.media_enabled:
+        print("\n  · Sonarr/Radarr not configured (optional: SONARR_URL + SONARR_API_KEY, RADARR_…)")
+        return True
+    ok = True
+    for inst in cfg.arr_instances:
+        print(f"\n{inst.name} check — {inst.url}")
+        client = ArrClient(inst, timeout=cfg.media_timeout, verify_ssl=cfg.media_verify_ssl)
+        try:
+            status = await client.status()
+            line("✔", "connect + API key", f"{status.get('appName', inst.name)} {status.get('version', '?')}")
+            queue = await client.queue()
+            releases = group_releases(queue)
+            flagged = sum(1 for r in releases if release_reason(r, watch_stalled=False))
+            line("✔", "queue", f"{len(releases)} download(s), {flagged} need attention now")
+            health = [h for h in await client.health() if h.type in ("warning", "error")]
+            line("✔", "health", f"{len(health)} issue(s)" + (f": {health[0].message[:80]}" if health else ""))
+        except ArrAuthError as exc:
+            line("✘", "API key", str(exc))
+            print(f"  Copy the key from {inst.name} → Settings → General → Security.")
+            ok = False
+        except ArrUnavailable as exc:
+            line("✘", "connect", str(exc))
+            print("  Is the URL reachable from this container? Use the NAS's LAN IP and the app's port.")
+            ok = False
+        except ArrCallError as exc:
+            line("✘", "request", str(exc))
+            ok = False
+        finally:
+            await client.close()
+    return ok
 
 
 def cmd_check() -> int:

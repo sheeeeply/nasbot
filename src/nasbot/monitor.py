@@ -8,6 +8,7 @@ What it reports:
   * reboots (boot time moved)
   * apps crashing, stopping, or recovering — TrueNAS raises no alert for these
   * an optional daily digest
+  * Sonarr / Radarr problems, through an optional MediaWatcher (see media.py)
 and it can be muted for a maintenance window, summarizing what it held back.
 """
 
@@ -15,16 +16,22 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 import discord
 
 from . import collectors, formatting
 from .config import Config, level_rank
 from .models import APP_STABLE_STATES, Alert, App, SystemInfo
+from .notify import Notification
 from .state import KnownAlert, State, StateStore
 from .truenas import NASCallError, NASUnavailable
+
+if TYPE_CHECKING:
+    from .media import MediaWatcher
+
+__all__ = ["BURST_THRESHOLD", "Monitor", "Notification"]
 
 log = logging.getLogger(__name__)
 
@@ -32,21 +39,14 @@ BURST_THRESHOLD = 6  # more new/cleared alerts than this in one poll get bundled
 REBOOT_TOLERANCE = 120.0  # seconds of boot-time jitter to ignore
 
 
-@dataclass
-class Notification:
-    kind: str
-    embed: discord.Embed
-    summary: str
-    urgent: bool = False
-
-
 class Monitor:
     def __init__(self, api: collectors.API, cfg: Config, store: StateStore,
-                 *, now: Callable[[], datetime] = lambda: datetime.now(UTC)):
+                 *, now: Callable[[], datetime] = lambda: datetime.now(UTC), media: MediaWatcher | None = None):
         self.api = api
         self.cfg = cfg
         self.store = store
         self.now = now
+        self.media = media
         self.state: State = store.load()
         self.last_poll_ok: bool | None = None
         self.last_poll_at: datetime | None = None
@@ -96,6 +96,12 @@ class Monitor:
             if self.cfg.watch_apps:
                 events += await self._check_apps()
             events += await self._maybe_digest(now)
+
+        if self.media is not None and self.media.due(now):
+            try:
+                events += await self.media.check(self.state, now, nas_down=self.state.down_since is not None)
+            except Exception:  # noqa: BLE001 - media problems must never break NAS monitoring
+                log.exception("Media check crashed; continuing")
 
         events = self._apply_silence(now, events)
         self.store.save(self.state)

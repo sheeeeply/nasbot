@@ -17,6 +17,7 @@ import discord
 from discord import app_commands
 
 from . import collectors, formatting, heartbeat
+from .arr import ArrAuthError, ArrCallError, ArrUnavailable
 from .config import Config
 from .monitor import Monitor, Notification
 from .truenas import NASCallError, NASUnavailable, TrueNAS
@@ -28,6 +29,13 @@ PERMISSIONS = discord.Permissions(view_channel=True, send_messages=True, embed_l
 
 
 def error_embed(exc: Exception, monitor: Monitor | None = None) -> discord.Embed:
+    if isinstance(exc, ArrAuthError):
+        return discord.Embed(title="🔑 API key rejected", description=formatting.truncate(str(exc), 1500)
+                             + "\n\nCopy the key again from the app's **Settings → General → Security** into "
+                               "nasbot's `.env`, then restart the bot.", color=formatting.COLOR_WARN)
+    if isinstance(exc, ArrUnavailable | ArrCallError):
+        return discord.Embed(title="🔴 Can't reach Sonarr/Radarr", description=formatting.truncate(str(exc), 1500),
+                             color=formatting.COLOR_CRIT)
     if isinstance(exc, NASUnavailable):
         embed = discord.Embed(title="🔴 Can't reach the NAS", description=formatting.truncate(str(exc), 1500),
                               color=formatting.COLOR_CRIT)
@@ -50,6 +58,10 @@ class Handlers:
         self.api = api
         self.monitor = monitor
         self.cfg = cfg
+
+    @property
+    def media(self):
+        return self.monitor.media
 
     # ---- access control
 
@@ -99,6 +111,16 @@ class Handlers:
             lines.append(f"🔕 Muted until {formatting.ts(until, 't')} ({formatting.ts(until)})")
         return discord.Embed(title="🏓 Pong", description="\n".join(lines), color=color)
 
+    async def media_queue(self) -> discord.Embed:
+        if self.media is None:
+            return _media_off_embed()
+        return formatting.media_queue_embed(await self.media.overview())
+
+    async def media_health(self) -> discord.Embed:
+        if self.media is None:
+            return _media_off_embed()
+        return formatting.media_health_embed(await self.media.overview())
+
     def mute(self, minutes: int) -> tuple[discord.Embed, list[Notification]]:
         notes = self.monitor.set_silence(minutes)
         if minutes <= 0:
@@ -113,9 +135,17 @@ class Handlers:
         return embed, notes
 
 
-class NASGroup(app_commands.Group):
-    def __init__(self, handlers: Handlers, bot: NASBot):
-        super().__init__(name="nas", description="TrueNAS status and alerts", guild_only=True)
+def _media_off_embed() -> discord.Embed:
+    return discord.Embed(title="Media watching is off",
+                         description="Set `SONARR_URL` / `SONARR_API_KEY` (and/or the Radarr pair) in nasbot's "
+                                     "`.env` and restart the bot.", color=formatting.COLOR_MUTED)
+
+
+class GuardedGroup(app_commands.Group):
+    """A slash-command group with the bot's access check and defer → follow-up handling."""
+
+    def __init__(self, handlers: Handlers, bot: NASBot, *, name: str, description: str):
+        super().__init__(name=name, description=description, guild_only=True)
         self.h = handlers
         self.bot = bot
 
@@ -133,12 +163,17 @@ class NASGroup(app_commands.Group):
         await interaction.response.defer(ephemeral=ephemeral, thinking=True)
         try:
             embed = await coro_factory()
-        except (NASUnavailable, NASCallError) as exc:
+        except (NASUnavailable, NASCallError, ArrUnavailable, ArrCallError) as exc:
             embed = error_embed(exc, self.h.monitor)
         except Exception as exc:  # noqa: BLE001 - never leave the user with "thinking…" forever
             log.exception("Command failed")
             embed = error_embed(exc)
         await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+
+
+class NASGroup(GuardedGroup):
+    def __init__(self, handlers: Handlers, bot: NASBot):
+        super().__init__(handlers, bot, name="nas", description="TrueNAS status and alerts")
 
     @app_commands.command(name="status", description="Overall health: CPU, memory, pools, alerts, apps")
     async def status(self, interaction: discord.Interaction) -> None:
@@ -175,6 +210,19 @@ class NASGroup(app_commands.Group):
             await self.bot.post(n)
 
 
+class MediaGroup(GuardedGroup):
+    def __init__(self, handlers: Handlers, bot: NASBot):
+        super().__init__(handlers, bot, name="media", description="Sonarr / Radarr downloads")
+
+    @app_commands.command(name="queue", description="What's downloading, and anything that needs you")
+    async def queue(self, interaction: discord.Interaction) -> None:
+        await self._run(interaction, self.h.media_queue)
+
+    @app_commands.command(name="health", description="Sonarr / Radarr health checks")
+    async def health(self, interaction: discord.Interaction) -> None:
+        await self._run(interaction, self.h.media_health)
+
+
 class NASBot(discord.Client):
     def __init__(self, cfg: Config, api: TrueNAS, monitor: Monitor):
         intents = discord.Intents.none()
@@ -186,6 +234,8 @@ class NASBot(discord.Client):
         self.handlers = Handlers(api, monitor, cfg)
         self.tree = app_commands.CommandTree(self)
         self.tree.add_command(NASGroup(self.handlers, self))
+        if monitor.media is not None:
+            self.tree.add_command(MediaGroup(self.handlers, self))
         self._monitor_task: asyncio.Task | None = None
         self._http: aiohttp.ClientSession | None = None
         self._announced = False
@@ -219,6 +269,8 @@ class NASBot(discord.Client):
                 await self._monitor_task
         if self._http:
             await self._http.close()
+        if self.monitor.media is not None:
+            await self.monitor.media.close()
         await self.api.close()
         await super().close()
 
@@ -284,6 +336,9 @@ class NASBot(discord.Client):
                     "Commands: `/nas status` `/nas pools` `/nas disks` `/nas alerts` `/nas apps` `/nas ping` "
                     "`/nas mute`")
             color = formatting.COLOR_OK if n_alerts == 0 else formatting.COLOR_WARN
+            if m.media is not None:
+                desc += (f"\nAlso watching **{' & '.join(m.media.names)}** every "
+                         f"{self.cfg.media_poll_interval // 60} min — `/media queue` `/media health`")
             if self.cfg.mention:
                 desc += f"\nUrgent ({self.cfg.mention_min_level.lower()}+) notifications ping {self.cfg.mention}."
         else:
