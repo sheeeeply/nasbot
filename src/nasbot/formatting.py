@@ -412,11 +412,15 @@ REASON_TEXT: dict[str, tuple[str, str, str]] = {
     "failed": ("❌", "download failed",
                "{app} normally blocklists a failed release and searches for another one by itself. If nothing new "
                "shows up in **Activity → Queue**, run a search for it manually."),
+    "waiting": ("⏳", "still waiting to import",
+                "{app} has held this finished download for over two days. Holds are normally temporary (a new "
+                "episode whose title is still *TBA*, an archive still being extracted). Hover the icon in "
+                "**{app} → Activity → Queue** for the reason; *Manual Import* (👤) imports it now."),
     "stalled": ("⏸️", "download stalled",
                 "No data is arriving (no seeders). Cleanuparr replaces stalled downloads automatically if it's set "
                 "up; otherwise remove it in **{app} → Activity → Queue** with *Blocklist and Search*."),
 }
-REASON_COLOR = {"import": COLOR_WARN, "failed": COLOR_ERROR, "stalled": COLOR_MUTED}
+REASON_COLOR = {"import": COLOR_WARN, "failed": COLOR_ERROR, "stalled": COLOR_MUTED, "waiting": COLOR_MUTED}
 
 
 def episode_ranges(episodes: list[tuple[int, int]], *, limit: int = 300) -> str:
@@ -484,7 +488,7 @@ def attention_burst_embed(inst: ArrInstance, raised: list[tuple[Release, str]]) 
         icon, headline, _ = REASON_TEXT[reason]
         eps = f" · {len(rel.episodes)} ep" if rel.episodes else ""
         lines.append(f"{icon} **{truncate(rel.subject, 80)}** — {headline}{eps}")
-    worst = max((r for _, r in raised), key=lambda r: {"stalled": 0, "import": 1, "failed": 2}[r])
+    worst = max((r for _, r in raised), key=REASON_RANK_FMT.__getitem__)
     embed = discord.Embed(title=f"⚠️ {len(raised)} {inst.name} downloads need attention", url=_queue_link(inst),
                           description=_join_lines(lines, MAX_DESCRIPTION - 200)
                           + f"\n\nOpen **{inst.name} → Activity → Queue** to sort them out.",
@@ -570,7 +574,7 @@ def imported_burst_embed(inst: ArrInstance, batches: list[list[ImportEvent]]) ->
 
 
 def media_queue_embed(overviews: list[AppOverview]) -> discord.Embed:
-    needs = sum(1 for ov in overviews for _, r in ov.releases if r in ("import", "failed"))
+    needs = sum(1 for ov in overviews for _, r in ov.releases if r in ("import", "failed"))  # not holds/stalls
     errors = any(ov.error for ov in overviews)
     color = COLOR_CRIT if errors else COLOR_WARN if needs else COLOR_OK
     embed = discord.Embed(title="Media queue", color=color)
@@ -584,13 +588,13 @@ def media_queue_embed(overviews: list[AppOverview]) -> discord.Embed:
             continue
         flagged = [(r, why) for r, why in ov.releases if why]
         active = [r for r, why in ov.releases if not why]
+        needs_you = sum(1 for _, why in flagged if why in ("import", "failed"))
         head = f"{len(ov.releases)} download{'s' if len(ov.releases) != 1 else ''}"
-        if flagged:
-            head += f" · ⚠️ {len(flagged)} need attention"
+        if needs_you:
+            head += f" · ⚠️ {needs_you} need{'s' if needs_you == 1 else ''} you"
         lines = [head]
         for rel, why in sorted(flagged, key=lambda rw: -REASON_RANK_FMT[rw[1]]):
-            icon, headline, _ = REASON_TEXT[why]
-            lines.append(f"{icon} **{truncate(rel.subject, 60)}** — {headline}")
+            lines.append(f"{REASON_TEXT[why][0]} **{truncate(rel.subject, 60)}** — {QUEUE_LABEL[why]}")
         for rel in sorted(active, key=lambda r: -(r.progress or 0))[:8]:
             pct = f"{rel.progress * 100:.0f}%" if rel.progress is not None else "?"
             eta = f" · done {ts(rel.eta)}" if rel.eta and (rel.progress or 0) < 1 else ""
@@ -598,13 +602,15 @@ def media_queue_embed(overviews: list[AppOverview]) -> discord.Embed:
             lines.append(f"{bar(rel.progress, 8)} {pct} **{truncate(rel.subject, 50)}** `{state}`{eta}")
         if len(active) > 8:
             lines.append(f"…and {len(active) - 8} more")
-        icon = "🟠" if flagged else "🟢"
+        icon = "🟠" if needs_you else "🟢"
         embed.add_field(name=f"{icon} {name}", value=_join_lines(lines, MAX_FIELD_VALUE), inline=False)
     embed.set_footer(text="Live from Sonarr/Radarr")
     return embed
 
 
-REASON_RANK_FMT = {"stalled": 0, "import": 1, "failed": 2}
+REASON_RANK_FMT = {"stalled": 0, "waiting": 1, "import": 2, "failed": 3}
+QUEUE_LABEL = {"import": "needs manual import", "failed": "download failed",
+               "waiting": "waiting to import (usually a temporary hold)", "stalled": "stalled"}
 
 
 def media_health_embed(overviews: list[AppOverview]) -> discord.Embed:

@@ -4,6 +4,8 @@ does for TrueNAS. No Discord I/O here; every rule is testable with fake clients.
 What it reports:
   * a download that needs a human — finished but "Unable to Import Automatically",
     or failed — after a grace period, once; and again when it's sorted
+  * a download still "Waiting to Import" for over two days (normally temporary:
+    e.g. Sonarr holds new episodes whose title is still TBA for up to 48 hours)
   * optionally, stalled downloads (off by default: Cleanuparr handles those)
   * Sonarr/Radarr health problems appearing / clearing (indexers down, download
     client unreachable, disk space…), first check per app is a silent baseline
@@ -41,16 +43,20 @@ from .state import State
 log = logging.getLogger(__name__)
 
 BURST_THRESHOLD = 5  # more new items than this in one check are bundled into one message
-REASON_RANK = {"stalled": 0, "import": 1, "failed": 2}
+REASON_RANK = {"stalled": 0, "waiting": 1, "import": 2, "failed": 3}
+# "Waiting to Import" is a temporary hold (TBA episode title, which Sonarr waits up to 48 h for; a
+# not-yet-extracted archive…). Only worth a message if it outlasts that window.
+WAITING_GRACE_SECONDS = 49 * 3600
 HEALTH_TYPES = ("warning", "error")
 
 
 def classify(item: QueueItem, *, watch_stalled: bool) -> str | None:
     """Why a queue row needs a human, or None if it doesn't."""
     state, status = item.tracked_state, item.tracked_status
-    # v4: importBlocked. v3 / older builds: importPending + warning ("Unable to Import Automatically").
-    if state == "importblocked" or (state == "importpending" and status == "warning"):
+    if state == "importblocked":  # "Downloaded - Unable to Import Automatically"
         return "import"
+    if state == "importpending" and status == "warning":  # "Downloaded - Waiting to Import" (temporary)
+        return "waiting"
     if state in ("failedpending", "failed") or status == "error":
         return "failed"
     if watch_stalled and state == "downloading" and status == "warning":
@@ -173,7 +179,7 @@ class MediaWatcher:
                 current[rel.key] = (rel, reason)
 
         known = state.media_attention.get(app, {})
-        grace = self.cfg.media_grace_minutes * 60
+        base_grace = self.cfg.media_grace_minutes * 60
         fresh: dict[str, dict] = {}
         raised: list[tuple[Release, str]] = []
         for key, (rel, reason) in current.items():
@@ -181,6 +187,7 @@ class MediaWatcher:
             if entry is None or entry.get("reason") != reason:
                 entry = {"first_seen": now.timestamp(), "notified": False, "reason": reason}
             entry = {**entry, "subject": rel.subject, "release": rel.release}
+            grace = max(base_grace, WAITING_GRACE_SECONDS) if reason == "waiting" else base_grace
             if not entry["notified"] and now.timestamp() - entry["first_seen"] >= grace:
                 entry["notified"] = True
                 raised.append((rel, reason))

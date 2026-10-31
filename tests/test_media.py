@@ -68,7 +68,7 @@ async def run(w: MediaWatcher, state: State, at: datetime, **kw):
 
 @pytest.mark.parametrize(("state", "status", "stalled", "expected"), [
     ("importBlocked", "warning", False, "import"),
-    ("importPending", "warning", False, "import"),  # Sonarr v3 spelling of the same thing
+    ("importPending", "warning", False, "waiting"),  # "Waiting to Import": a temporary hold (TBA title…)
     ("importPending", "ok", False, None),  # importing normally
     ("failedPending", "warning", False, "failed"),
     ("downloading", "error", False, "failed"),
@@ -100,6 +100,31 @@ async def test_import_blocked_pack_is_one_message_after_grace_then_quiet():
     assert fields["Episodes"] == "S01E124–E170 (47 episodes)"
     assert "Invalid season or episode — 47 files" in fields["What Sonarr says"]
     assert await run(w, state, T0 + timedelta(minutes=15)) == []  # never repeated
+
+
+async def test_waiting_to_import_is_only_reported_if_it_outlasts_the_hold():
+    """Sonarr holds a new episode whose title is still TBA for up to 48 h ("Waiting to Import").
+    That's normal and resolves itself, so it must not ping after the usual 10 minutes."""
+    s = FakeArr()
+    s.rows = [sonarr_row(1, download_id="E5", release="[Erai-raws] Black Clover 2nd Season - 05 [1080p]",
+                         series="Black Clover", season=2, episode=5, state="importPending", status="warning",
+                         queue_status="completed", sizeleft=0,
+                         messages=[{"title": "[Erai-raws] Black Clover 2nd Season - 05.mkv",
+                                    "messages": ["Episode has a TBA title and recently aired"]}])]
+    w, state = watcher(s), State()
+    assert await run(w, state, T0) == []
+    assert await run(w, state, T0 + timedelta(hours=24)) == []
+    assert await run(w, state, T0 + timedelta(hours=48, minutes=59)) == []
+    notes = await run(w, state, T0 + timedelta(hours=49))
+    assert notes[0].summary == "Sonarr: still waiting to import — Black Clover"
+    assert "TBA" in notes[0].embed.description
+    # the common case: the title arrives / 48 h pass and it imports — nothing was ever posted
+    s2 = FakeArr()
+    s2.rows = s.rows
+    w2, state2 = watcher(s2), State()
+    await run(w2, state2, T0)
+    s2.rows = []
+    assert await run(w2, state2, T0 + timedelta(hours=30)) == []
 
 
 async def test_resolved_only_after_it_was_announced():

@@ -181,7 +181,9 @@ in **Activity → Queue** with an orange icon until you happen to look. It's rea
 numbering, a sample, an unexpected file layout…) and failed downloads. Stalled torrents are left alone by
 default because tools like [Cleanuparr](https://github.com/Cleanuparr/Cleanuparr) replace them automatically —
 set `MEDIA_WATCH_STALLED=true` if you don't run one. Nothing is reported until it has been stuck for
-`MEDIA_GRACE_MINUTES` (default 10), so downloads that sort themselves out never make noise.
+`MEDIA_GRACE_MINUTES` (default 10), so downloads that sort themselves out never make noise. *Waiting to
+Import* is treated as the temporary hold it usually is — e.g. Sonarr waits up to 48 hours to import a new
+episode whose title is still TBA — and is only reported if it lasts more than 49 hours.
 
 Mute (`/nas mute`) and state persistence cover media notifications too.
 

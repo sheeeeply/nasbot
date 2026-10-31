@@ -99,9 +99,14 @@ def test_media_queue_and_health_embeds():
     e = f.media_queue_embed([ok, down])
     assert e.title == "Media queue" and e.color.value == f.COLOR_CRIT
     sonarr_field, radarr_field = e.fields
-    assert sonarr_field.name == "🟠 Sonarr" and "⚠️ 1 need attention" in sonarr_field.value
+    assert sonarr_field.name == "🟠 Sonarr" and "⚠️ 1 needs you" in sonarr_field.value
     assert "📥 **Black Clover** — needs manual import" in sonarr_field.value and "75%" in sonarr_field.value
     assert radarr_field.name == "🔴 Radarr"
+    held = rel_from([sonarr_row(3, download_id="E5", release="Black Clover 2nd Season - 05", series="Black Clover",
+                                season=2, episode=5, state="importPending", status="warning")])
+    calm = f.media_queue_embed([AppOverview(SONARR, releases=[(held, "waiting")])])
+    assert calm.fields[0].name == "🟢 Sonarr" and "needs you" not in calm.fields[0].value
+    assert "⏳ **Black Clover** — waiting to import (usually a temporary hold)" in calm.fields[0].value
     empty = f.media_queue_embed([AppOverview(SONARR)])
     assert empty.fields[0].value == "Queue is empty." and empty.color.value == f.COLOR_OK
 
